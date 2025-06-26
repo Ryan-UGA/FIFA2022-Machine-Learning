@@ -90,3 +90,19 @@ Based on our findings, the USMNT can improve international competitiveness by:
 - **Focusing on quality possessions** rather than just time on ball
 
 These recommendations emphasize **execution and precision** over passive control.
+
+## What Was Used
+- R & RMarkdown
+- Caret for modeling and tuning
+- ggplot2 for visualization
+- XGBoost, randomForest, and glmnet for further modeling
+
+## Limitations
+- Small sample size (63 matches, no ties)
+- Model performance constrained by class imbalance
+- Limited to match-level stats (no player-level or xG data)
+
+## Next Steps
+- Integrate player-level, spatial tracking, and more data
+- Build a dashboard interface for coaching staff
+- Test models on future World Cup qualifiers and matches
