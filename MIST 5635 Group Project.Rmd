@@ -1,0 +1,421 @@
+---
+title: "MIST 5635 Group Project"
+author: "Ryan Cullen, Alec Zerona, Warren Paintsil, and Will Hensley"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Tidyverse, Caret, randomForest, and gbm Libraries Loaded
+
+#### The tidyverse package provides the ability to pipe (%>%), methods for data handling, and relatively easy-to-understand data science methods.
+
+#### The caret package provides the train, trainControl, and other methods used in the K-Fold (K = 5) cross-validation and parameter tuning to ensure each model is the optimal model.
+
+#### The randomForest package was loaded specifically for the varImpPlot for random forests. This package can do random forest models, but the caret package was better for random forest models (reasoning in caret package description above). 
+
+#### The gbm package was loaded to help with the varImp method for gradient boosted. This package can do gradient boosted models, but the caret package was better for gradient boosted models (reasoning in caret package description above).
+```{r setup}
+library(tidyverse) # %>% pipes, methods for data cleaning, etc.
+library(caret) # all models
+library(randomForest) # varImpPlot method
+library(gbm) # varImp from caret package requires something from this package
+```
+
+# Data Reading and Original Dimensions
+```{r}
+set.seed(42)
+og_data <- read_csv('Fifa_world_cup_matches.csv')
+cat("Original Data Dimensions (Before Data Handling):",dim(og_data))
+```
+
+# Removed An Observation, Corrected Feature Names, and Made Possession Numeric Instead of String
+```{r}
+og_data <- og_data[-10,] # this game was a blowout 7-0, so we are not including it in the dataset
+
+og_data <- og_data %>%
+  rename('completed defensive line breaks team1' = 'completed defensive line breaksteam1',
+           'completed line breaks team1' = 'completed line breaksteam1',
+           'attempts inside the penalty area team2'='attempts inside the penalty area  team2',
+           'attempts outside the penalty area team1'='attempts outside the penalty area  team1',
+           'attempts outside the penalty area team2'='attempts outside the penalty area  team2')
+
+og_data['possession team1'] <- og_data$`possession team1` %>% str_remove('%') %>% as.numeric()
+og_data['possession team2'] <- og_data$`possession team2` %>% str_remove('%') %>% as.numeric()
+og_data['possession in contest'] <- og_data$`possession in contest` %>% str_remove('%') %>% as.numeric()
+```
+
+# Feature Engineering
+## Offensive Opportunities (team1 - team2)
+#### Features in this category include shot accuracy, shot attempts, total shot attempts, crosses, corners, free kicks, and passing the line of defense.
+```{r}
+data <- tibble(row_number = og_data %>% nrow() %>% seq_len())
+
+team1_shot_accuracy <- og_data['on target attempts team1'] / og_data['total attempts team1']
+team2_shot_accuracy <- og_data['on target attempts team2'] / og_data['total attempts team2']
+data['team1-team2 shot accuracy'] <- team1_shot_accuracy - team2_shot_accuracy # focus on high % and better shots
+
+data['team1-team2 total attempts'] <- og_data['total attempts team1'] - og_data['total attempts team2'] #just keep shooting
+
+data['team1-team2 crosses'] <- og_data['crosses team1'] - og_data['crosses team2'] #just cross more than opponent
+
+team1_cross_efficiency <- og_data['crosses completed team1'] / og_data['crosses team1']
+team2_cross_efficiency <- og_data['crosses completed team2'] / og_data['crosses team2']
+data['team1-team2 cross efficiency'] <- team1_cross_efficiency - team2_cross_efficiency #better crosses = better result?
+
+data['team1-team2 corners'] <- og_data['corners team1'] - og_data['corners team2'] #generate more corners and chances
+data['team1-team2 free kicks'] <- og_data['free kicks team1'] - og_data['free kicks team2'] #generate more free kicks and chances
+
+team1_line_break_efficiency <- og_data['completed line breaks team1'] / og_data['attempted line breaks team1']
+team2_line_break_efficiency <- og_data['completed line breaks team2'] / og_data['attempted line breaks team2']
+data['team1-team2 line break efficiency'] <- team1_line_break_efficiency - team2_line_break_efficiency
+
+data['team1-team2 line breaks attempted'] <- og_data['attempted line breaks team1'] - og_data['attempted line breaks team2']
+
+data$`team1 win` <- ifelse(og_data$`number of goals team1` > og_data$`number of goals team2`,
+                           1,0)
+```
+
+## Defensive Opportunities (team1 - team2)
+#### Features in this category include turnovers and pressure, defensive line break efficiency, fouls, and offsides
+```{r}
+data['team1-team2 forced turnovers diff'] <- og_data['forced turnovers team1'] - og_data['forced turnovers team2'] #be more aggressive defensively?
+data['team1-team2 defensive pressures applied'] <- og_data['defensive pressures applied team1'] - og_data['defensive pressures applied team2'] #more aggressive?
+
+data['team1-team2 defensive line breaks attempted'] <- og_data['attempted defensive line breaks team1'] - og_data['attempted defensive line breaks team2']
+
+team1_def_line_break_efficiency <- og_data['completed defensive line breaks team1'] / og_data['attempted defensive line breaks team1']
+team2_def_line_break_efficiency <- og_data['completed defensive line breaks team2'] / og_data['attempted defensive line breaks team2']
+data['team1-team2 defensive line break efficiency'] <- team1_def_line_break_efficiency - team2_def_line_break_efficiency
+```
+
+## Tactical Movement and Passing Dynamics (just team1)
+#### Features in this category include possession, strategies in passing more vs. passing efficiently, switching the field, movement of the ball, and preferred field positioning (left, center, right) of attack
+```{r}
+data['team1-team2-contested possession'] <- og_data['possession team1'] - og_data['possession team2'] - og_data['possession in contest']
+
+data['team1-team2 passes'] <- og_data['passes team1'] - og_data['passes team2']
+
+team1_pass_efficiency <- og_data['passes completed team1'] / og_data['passes team1']; team2_pass_efficiency <- og_data['passes completed team2'] / og_data['passes team2']
+data['team1-team2 pass efficiency'] <- team1_pass_efficiency - team2_pass_efficiency
+
+data['team1-team2 switches of play completed'] <- og_data['switches of play completed team1'] - og_data['switches of play completed team2'] # switch the field more -> fatigue opponent when attacking
+
+data['team1-team2 total offers to receive'] <- og_data['total offers to receive team1'] - og_data['total offers to receive team1']
+
+data <- data %>% select(-row_number)
+cat("Data Dimensions (After Feature Engineering):",dim(data))
+```
+
+# New Data Cleaning (Ensuring Data is Clean Before Modeling)
+We checked for duplicate rows, null values, and infinite values (the nested for loop enhances interpretability and is fine because of the small dataset -> sapply would probably be used for a larger dataset).
+```{r}
+cat("Duplicate rows:", data %>% duplicated() %>% sum())
+
+data[10,'team1-team2 shot accuracy'] <- 0
+cat("\n\nNumber of nulls:",data %>% is.na() %>% sum()) #colSums() would show each column
+# which(is.na(data)) # index = 10 had one, but fixed to 0
+
+no_infinite_values <- T
+for (i in data %>% rownames() %>% length() %>% seq_len()) { # checks for infinite values, prints nothing since there are no infinite values
+  for (j in data %>% colnames() %>% length() %>% seq_len()) {
+    if (data[[i,j]] %>% is.infinite() ) {
+      cat("Infinite value at row",i,"and column",j,'\n\n')
+      no_infinite_values <- F
+    }
+  }
+}
+if (no_infinite_values) {
+  cat("\n\nNo infinite values")
+}
+```
+
+# Modeling - Fit the model with K-fold CV and parameter tuning, coefficients for regression OR variable importance for random forest and boosting, calculate test error rate, and construct the confusion matrix 
+## Making y a Factor and Partioning Data
+```{r}
+data$`team1 win` <- data$`team1 win` %>% as.factor()
+
+idx <- createDataPartition(data$`team1 win`, p = 0.75, list = F)
+data_train <- data[idx,]
+data_test <- data[-idx,]
+```
+
+## Logistic Regression Models
+#### Fitting the 3 Variations (Elastic Net, Ridge, and LASSO) with K-Fold Cross-Validation, Alpha Tuning, and Lambda Tuning for Training Data
+```{r}
+control <- trainControl(method='cv', number = 5)
+
+grid_both <- expand.grid(alpha=seq(0,1,length=10), lambda = 10^seq(3,-3,length=20)) # elastic net (Ridge and LASSO regularization)
+grid_ridge <- expand.grid(alpha=0, lambda = 10^seq(3,-3,length=20))
+grid_lasso <- expand.grid(alpha=1, lambda = 10^seq(3,-3,length=20)) 
+
+logistic.regression.both <- train(
+  form = `team1 win` ~ .,                                  
+  data = data_train,                                    
+  trControl = control,
+  tuneGrid = grid_both,
+  method = "glmnet",                                      
+  family = "binomial"                                    
+)
+
+logistic.regression.ridge <- train(
+  form = `team1 win` ~ .,
+  data = data_train,
+  trControl = control,
+  tuneGrid = grid_ridge,
+  method="glmnet",
+  family="binomial"
+)
+
+logistic.regression.lasso <- train(
+  form = `team1 win` ~ .,
+  data = data_train,
+  trControl = control,
+  tuneGrid = grid_lasso,
+  method="glmnet",
+  family="binomial"
+)
+
+max_accuracy_both <- logistic.regression.both$results[,'Accuracy'] %>% max()
+max_accuracy_ridge <- logistic.regression.ridge$results[,'Accuracy'] %>% max()
+max_accuracy_lasso <- logistic.regression.lasso$results[,'Accuracy'] %>% max()
+
+alpha_both <- logistic.regression.both$bestTune[,1]
+alpha_ridge <- logistic.regression.ridge$bestTune[,1]
+alpha_lasso <- logistic.regression.lasso$bestTune[,1]
+
+best_lambda_both <- logistic.regression.both$bestTune[,2]
+best_lambda_ridge <- logistic.regression.ridge$bestTune[,2]
+best_lambda_lasso <- logistic.regression.lasso$bestTune[,2]
+
+data.frame(
+  Regularization = c("Both","Ridge","LASSO"),
+  Best_Training_Accuracy = c(max_accuracy_both, max_accuracy_ridge, max_accuracy_lasso),
+  Alpha = c(alpha_both, alpha_ridge, alpha_lasso),
+  Best_Lambda = c(best_lambda_both, best_lambda_ridge, best_lambda_lasso)) #%>%
+  #filter(Best_Training_Accuracy == max(Best_Training_Accuracy)) # the best (accuracy) logistic regression model
+```
+
+#### Plotting the 3 Best Models
+```{r}
+par(mfrow = c(3,1))
+
+plot(logistic.regression.both, main = "Both Ridge and LASSO", xlim = c(0,10))
+plot(logistic.regression.ridge, main = "Ridge", xlim = c(0,15))
+plot(logistic.regression.lasso, main = "LASSO", xlim = c(0,5))
+```
+
+#### Coefficients of the 3 Best Models (Best Model For Each Variation)
+```{r}
+coefficients_both <- coef(logistic.regression.both$finalModel, logistic.regression.both$bestTune$lambda) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  rownames_to_column("X")
+
+coefficients_ridge <- coef(logistic.regression.ridge$finalModel, logistic.regression.ridge$bestTune$lambda) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  rownames_to_column("X")
+
+coefficients_lasso <- coef(logistic.regression.lasso$finalModel, logistic.regression.lasso$bestTune$lambda) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  rownames_to_column("X")
+
+data.frame(
+  X = coefficients_both$X,
+  s1_Both = coefficients_both$s1,
+  s1_Ridge = coefficients_ridge$s1,
+  s1_LASSO = coefficients_lasso$s1)
+```
+
+#### Testing Error Rate for 3 Variations in Logistic Regression
+```{r}
+yhat_both <- predict(logistic.regression.both, data_test, type = "raw")
+yhat_ridge <- predict(logistic.regression.ridge, data_test, type = "raw")
+yhat_lasso <- predict(logistic.regression.lasso, data_test, type = "raw")
+
+mcr_both <- mean(yhat_both != data_test$`team1 win`)
+mcr_ridge <- mean(yhat_ridge != data_test$`team1 win`)
+mcr_lasso <- mean(yhat_lasso != data_test$`team1 win`)
+
+data.frame(
+  Regularization = c("Both","Ridge","LASSO"),
+  Testing_Error_Rate = c(mcr_both, mcr_ridge, mcr_lasso)
+)
+```
+
+#### Confusion Matrix Terminology
+```{r}
+data.frame(
+  "Actual_Win" = c("True Positive (TP)", "False Negative (FN)"),
+  "Actual_Loss" = c("False Positive (FP)", "True Negative (TN)"),
+  row.names = c("Predicted Win", "Predicted Loss")
+)
+```
+
+#### Confusion Matrix for Both Ridge and LASSO
+```{r}
+table <- table(yhat_both,data_test$`team1 win`)
+table[c('1','0'),c('1','0')]
+```
+
+#### Confusion Matrix for Ridge
+```{r}
+table <- table(yhat_ridge,data_test$`team1 win`)
+table[c('1','0'),c('1','0')]
+```
+
+#### Confusion Matrix for LASSO
+```{r}
+table <- table(yhat_lasso,data_test$`team1 win`)
+table[c('1','0'),c('1','0')]
+```
+
+## Random Forest Model
+#### Fitting the Random Forest with K-Fold Cross-Validation and Tuning mtry (number of features in tree)
+```{r}
+p <- dim(data)[2] - 1  # number of parameters = number of columns - target variable
+grid_random_forest <- expand.grid(mtry=1:p)
+random.forest <- train(
+                    form = `team1 win` ~ ., 
+                    data = data_train, 
+                    method='rf',  
+                    tuneGrid = grid_random_forest, 
+                    trControl = control)
+
+cat("The best random forest has mtry parameter =",random.forest$bestTune[[1]])
+cat("The best random forest has accuracy =", random.forest$results[,'Accuracy'] %>% max())
+
+plot(random.forest)
+```
+
+#### Variable Importance for Best Random Forest Model
+```{r}
+varImpPlot(random.forest$finalModel,
+           sort = T,
+           main = "Variable Importance")
+```
+
+#### Testing Error Rate for Random Forest
+```{r}
+yhat_rf <- predict(random.forest, data_test)
+cat("Testing error rate for random forest:",mean(yhat_rf != data_test$`team1 win`))
+```
+
+#### Confusion Matrix Terminology
+```{r}
+data.frame(
+  "Actual_Win" = c("True Positive (TP)", "False Negative (FN)"),
+  "Actual_Loss" = c("False Positive (FP)", "True Negative (TN)"),
+  row.names = c("Predicted Win", "Predicted Loss")
+)
+```
+
+#### Confusion Matrix for Random Forest
+```{r}
+table <- table(yhat_rf,data_test$`team1 win`)
+table[c('1','0'),c('1','0')]
+```
+
+## Boosted Models (Extreme Gradient Boost or xgboost will be better results, Normal is more interpretable)
+#### Fitting the Gradient Boosted Model with K-Fold Cross-Validation and Tuning mtry (number of features in tree)
+```{r}
+grid_boost <- expand.grid(interaction.depth = 1:5, 
+                       n.trees = seq(100,500,1000), 
+                       shrinkage = c(0.1, 0.5),
+                       n.minobsinnode = c(1:4))
+gradient.boosted.model <- train(
+                  form = `team1 win` ~ ., 
+                  data = data_train, 
+                  method='gbm', 
+                  tuneGrid = grid_boost,
+                  verbose=FALSE,
+                  trControl=control) %>%
+  suppressWarnings()
+
+gbm_accuracy <- c('accuracy'=gradient.boosted.model$results[,'Accuracy'] %>% max())
+
+data.frame(gbm_accuracy, gradient.boosted.model$bestTune, row.names = "Best GBM") %>% print()
+
+plot(gradient.boosted.model)
+```
+
+#### Variable Importance for Best Gradient Boosted Model
+```{r}
+varImp(gradient.boosted.model)
+```
+
+#### Testing Error Rate for Gradient Boosted Model
+```{r}
+yhat_gbm <- predict(gradient.boosted.model, data_test)
+cat("Testing error rate for gradient boosted:",mean(yhat_gbm != data_test$`team1 win`))
+```
+
+#### Confusion Matrix Terminology
+```{r}
+data.frame(
+  "Actual_Win" = c("True Positive (TP)", "False Negative (FN)"),
+  "Actual_Loss" = c("False Positive (FP)", "True Negative (TN)"),
+  row.names = c("Predicted Win", "Predicted Loss")
+)
+```
+
+#### Confusion Matrix for Gradient Boosted Model
+```{r}
+table <- table(yhat_gbm,data_test$`team1 win`)
+table[c('1','0'),c('1','0')]
+```
+
+## XGBoost Model (Extreme Gradient Boosted)
+#### Fitting the XGBoost with K-Fold Cross-Validation and Tuning Various Parameters
+```{r}
+grid_xgboost <- expand.grid(
+  nrounds = seq(from = 50, to = 500, by = 50),
+  eta = c(0.05, 0.1, 0.3),
+  max_depth = 1:5,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+xg.boost <- train(`team1 win` ~ ., 
+                   data=data_train, 
+                   method='xgbTree', 
+                   verbose=FALSE,
+                   verbosity=0,
+                   tuneGrid = grid_xgboost,
+                   trControl=control)
+
+xgboost_accuracy <- c('accuracy'=xg.boost$results[,'Accuracy'] %>% max())
+
+data.frame(xgboost_accuracy, xg.boost$bestTune, row.names = "Best XGBoost") %>% print()
+
+plot(xg.boost)
+```
+
+#### Variable Importance For XGBoost
+```{r}
+varImp(xg.boost)
+```
+
+#### Testing Error Rate for XGBoost
+```{r}
+yhat_xgboost <- predict(xg.boost, data_test)
+cat("Testing error rate for XGBoost:",mean(yhat_xgboost != data_test$`team1 win`))
+```
+
+#### Confusion Matrix Terminology
+```{r}
+data.frame(
+  "Actual_Win" = c("True Positive (TP)", "False Negative (FN)"),
+  "Actual_Loss" = c("False Positive (FP)", "True Negative (TN)"),
+  row.names = c("Predicted Win", "Predicted Loss")
+)
+```
+
+#### Confusion Matrix for XGBoost Model
+```{r}
+table <- table(yhat_xgboost,data_test$`team1 win`)
+table[c('1','0'),c('1','0')]
+```
